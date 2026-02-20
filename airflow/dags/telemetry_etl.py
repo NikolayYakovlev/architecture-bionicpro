@@ -21,13 +21,32 @@ default_args = {
     'execution_timeout': timedelta(minutes=30),
 }
 
-def extract_telemetry_data(execution_date, **context):
-    logger.info(f"Extracting telemetry data for {execution_date}")
+def extract_telemetry_data(**context):
+    logger.info("Starting incremental telemetry data extraction")
+    
+    clickhouse_host = os.getenv('CLICKHOUSE_HOST', 'clickhouse')
+    clickhouse_port = int(os.getenv('CLICKHOUSE_PORT', '8123'))
+    clickhouse_user = os.getenv('CLICKHOUSE_USER', 'default')
+    clickhouse_password = os.getenv('CLICKHOUSE_PASSWORD', 'clickhouse')
+    
+    try:
+        ch_client = clickhouse_connect.get_client(
+            host=clickhouse_host,
+            port=clickhouse_port,
+            username=clickhouse_user,
+            password=clickhouse_password
+        )
+        
+        max_id_result = ch_client.query("SELECT COALESCE(MAX(id), 0) as max_id FROM bionicpro.telemetry_raw")
+        max_loaded_id = max_id_result.result_rows[0][0] if max_id_result.result_rows else 0
+        
+        logger.info(f"Maximum loaded ID in ClickHouse: {max_loaded_id}")
+        ch_client.close()
+    except Exception as e:
+        logger.warning(f"Could not get max ID from ClickHouse: {e}. Starting from 0")
+        max_loaded_id = 0
     
     pg_hook = PostgresHook(postgres_conn_id='postgres_telemetry')
-    
-    start_date = execution_date.replace(tzinfo=None) if hasattr(execution_date, 'replace') else execution_date
-    end_date = (execution_date + timedelta(days=1)).replace(tzinfo=None)
     
     query = """
         SELECT 
@@ -41,17 +60,17 @@ def extract_telemetry_data(execution_date, **context):
             action_executed,
             created_at
         FROM sensor_data
-        WHERE timestamp >= %s AND timestamp < %s
-        ORDER BY timestamp
+        WHERE id > %s
+        ORDER BY id
     """
     
     connection = pg_hook.get_conn()
-    df = pd.read_sql(query, connection, params=[start_date, end_date])
+    df = pd.read_sql(query, connection, params=[max_loaded_id])
     connection.close()
     
-    logger.info(f"Extracted {len(df)} records from PostgreSQL")
+    logger.info(f"Extracted {len(df)} new records from PostgreSQL (id > {max_loaded_id})")
     
-    temp_file = f'/tmp/telemetry_{execution_date.strftime("%Y%m%d")}.parquet'
+    temp_file = f'/tmp/telemetry_{datetime.now().strftime("%Y%m%d_%H%M%S")}.parquet'
     df.to_parquet(temp_file, index=False)
     
     context['task_instance'].xcom_push(key='telemetry_file', value=temp_file)

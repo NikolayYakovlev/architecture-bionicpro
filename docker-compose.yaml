@@ -3,6 +3,7 @@ version: '3.8'
 services:
   keycloak_db:
     image: postgres:14
+    container_name: keycloak_db
     environment:
       POSTGRES_DB: keycloak_db
       POSTGRES_USER: keycloak_user
@@ -11,11 +12,18 @@ services:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "keycloak_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - bionicpro-network
       
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
+    container_name: keycloak
     environment:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
@@ -35,7 +43,15 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      - keycloak_db
+      keycloak_db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
     networks:
       - bionicpro-network
       
@@ -43,6 +59,7 @@ services:
     build:
       context: ./bff
       dockerfile: Dockerfile
+    container_name: bff
     ports:
       - "4000:4000"
     environment:
@@ -55,11 +72,19 @@ services:
       KEYCLOAK_CLIENT_SECRET: BFF-SECRET-CHANGE-IN-PRODUCTION-123456
       BFF_URL: http://localhost:4000
       FRONTEND_URL: http://localhost:3000
-      API_URL: http://api:8000
+      API_URL: http://reports-api:8000
       SESSION_SECRET: dev-session-secret-change-in-production
       COOKIE_DOMAIN: localhost
     depends_on:
-      - keycloak
+      keycloak:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:4000/health" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
     networks:
       - bionicpro-network
       
@@ -67,6 +92,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    container_name: frontend
     ports:
       - "3000:3000"
     environment:
@@ -76,6 +102,249 @@ services:
       - bff
     networks:
       - bionicpro-network
+
+  postgres-airflow:
+    image: postgres:15-alpine
+    container_name: postgres-airflow
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-airflow-data:/var/lib/postgresql/data
+    ports:
+      - "5436:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - bionicpro-network
+
+  postgres-telemetry:
+    image: postgres:15-alpine
+    container_name: postgres-telemetry
+    environment:
+      POSTGRES_USER: telemetry
+      POSTGRES_PASSWORD: telemetry
+      POSTGRES_DB: telemetry_db
+    volumes:
+      - postgres-telemetry-data:/var/lib/postgresql/data
+      - ./airflow/scripts/init_telemetry_db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "telemetry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - bionicpro-network
+
+  postgres-crm:
+    image: postgres:15-alpine
+    container_name: postgres-crm
+    environment:
+      POSTGRES_USER: crm
+      POSTGRES_PASSWORD: crm
+      POSTGRES_DB: crm_db
+    volumes:
+      - postgres-crm-data:/var/lib/postgresql/data
+      - ./airflow/scripts/init_crm_db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "crm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - bionicpro-network
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.12-alpine
+    container_name: clickhouse
+    environment:
+      CLICKHOUSE_DB: bionicpro
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./airflow/scripts/clickhouse_config.xml:/etc/clickhouse-server/config.d/ipv4_only.xml
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user default --password clickhouse --query='SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - bionicpro-network
+
+  clickhouse-init:
+    image: clickhouse/clickhouse-server:23.12-alpine
+    container_name: clickhouse-init
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - ./airflow/scripts/init_clickhouse.sql:/init.sql:ro
+    entrypoint: /bin/sh
+    command: >
+      -c "
+      echo 'Waiting for ClickHouse to be ready...';
+      sleep 5;
+      echo 'Initializing ClickHouse database...';
+      clickhouse-client --host clickhouse --port 9000 --user default --password clickhouse --multiquery < /init.sql;
+      echo 'ClickHouse initialization completed successfully';
+      "
+    networks:
+      - bionicpro-network
+    restart: "no"
+
+  airflow-webserver:
+    image: apache/airflow:2.9.1-python3.11
+    container_name: airflow-webserver
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      clickhouse-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'bionicpro_secret_key_2024'
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+      
+      AIRFLOW_CONN_POSTGRES_TELEMETRY: postgresql://telemetry:telemetry@postgres-telemetry:5432/telemetry_db
+      AIRFLOW_CONN_POSTGRES_CRM: postgresql://crm:crm@postgres-crm:5432/crm_db
+      AIRFLOW_CONN_CLICKHOUSE: clickhouse://default:clickhouse@clickhouse:9000/bionicpro
+      
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DATABASE: bionicpro
+      
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/requirements.txt:/requirements.txt
+    ports:
+      - "8081:8080"
+    command: >
+      bash -c "pip install --no-cache-dir -r /requirements.txt &&
+               airflow db init &&
+               airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@bionicpro.com --password admin &&
+               airflow webserver"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - bionicpro-network
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.1-python3.11
+    container_name: airflow-scheduler
+    depends_on:
+      airflow-webserver:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      
+      AIRFLOW_CONN_POSTGRES_TELEMETRY: postgresql://telemetry:telemetry@postgres-telemetry:5432/telemetry_db
+      AIRFLOW_CONN_POSTGRES_CRM: postgresql://crm:crm@postgres-crm:5432/crm_db
+      AIRFLOW_CONN_CLICKHOUSE: clickhouse://default:clickhouse@clickhouse:9000/bionicpro
+      
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DATABASE: bionicpro
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/requirements.txt:/requirements.txt
+    command: >
+      bash -c "pip install --no-cache-dir -r /requirements.txt &&
+               airflow scheduler"
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - bionicpro-network
+  
+  reports-api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: reports-api
+    ports:
+      - "8000:8000"
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DATABASE: bionicpro
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: reports-realm
+      KEYCLOAK_CLIENT_ID: bionicpro-bff
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      clickhouse-init:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - bionicpro-network
+    restart: unless-stopped
+
+volumes:
+  postgres-airflow-data:
+  postgres-telemetry-data:
+  postgres-crm-data:
+  clickhouse-data:
 
 networks:
   bionicpro-network:
